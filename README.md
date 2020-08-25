@@ -7,7 +7,7 @@
 Для работы скрипта нужно:
 
 1. GitLab Community Edition с включенной аутентификацией через LDAP.
-1. Программы curl, jq и ldapsearch из пакета ldap-utils.
+1. Программы curl, jq и ldapsearch из пакета openldap-clients.
 
 # Установка
 
