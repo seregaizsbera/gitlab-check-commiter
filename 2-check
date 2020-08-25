@@ -1,7 +1,7 @@
 #! /bin/bash
 
 GITLAB_BASE="https://gitlab.example.com"
-GITLAB_API="https://gitlab.example.com/api/v4"
+GITLAB_API="$GITLAB_BASE/api/v4"
 AUTH_TOKEN="changeit"
 LDAP_URL="ldaps://ldap.example.com:636"
 BASE_DN="ou=users,dc=example,dc=com"
@@ -23,7 +23,7 @@ mirrors[${#mirrors[*]}]="mirrors/*"
 
 # Особые пользователи, коммиты которых не блокируются
 declare -a superusers
-#superusers[${#superuser[*]}]="someuser"
+#superusers[${#superusers[*]}]="someuser"
 
 # gitlabSearch search cnVar displayNameVar mailVar dnVar resultVar
 function gitlabSearch() {
