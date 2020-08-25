@@ -150,25 +150,6 @@ function getLdapDisplayNameByEmail() {
     return
 }
 
-if [ "$HOOK_DEBUG" = "1" ]; then
-    set
-    set -x
-fi
-
-dt1="$(date "+%F-%H" | sha256sum)"
-dt1="${dt1:0:8}"
-FORCE_KEY="FORCE_$dt1"
-FORCE="0"
-DRY_RUN="0"
-for i in $(seq 0 1 "${GIT_PUSH_OPTION_COUNT:-0}"); do
-    option="GIT_PUSH_OPTION_$i"
-    if [ "${!option}" = "$FORCE_KEY" ]; then
-        FORCE="1"
-    elif [ "${!option}" = "dry-run" ]; then
-        DRY_RUN="1"
-    fi
-done
-
 FORK="0"
 dir="$(pwd)"
 dir="${dir#$REPO_BASE/}"
@@ -200,14 +181,6 @@ for lfwltnqh in nxacyvck; do # цикл из одной итерации
     if [ "$RESULT" != "OK" ]; then
         warnings[${#warnings[*]}]="Неизвестная ошибка tmcvplmr. Не удалось найти в GitLab пользователя \"$GL_USERNAME\". RESULT=\"$RESULT\"."
         break;
-    fi
-    if [ "$HOOK_DEBUG" = "1" ]; then
-        echo "GL_ID=$GL_ID"
-        echo "GL_USERNAME=$GL_USERNAME"
-        echo "PUSHER_GITLAB_LOGIN=$PUSHER_GITLAB_LOGIN"
-        echo "PUSHER_GITLAB_NAME=$PUSHER_GITLAB_NAME"
-        echo "PUSHER_GITLAB_EMAIL=$PUSHER_GITALB_EMAIL"
-        echo "PUSHER_GITLAB_DN=$PUSHER_GITLAB_DN"
     fi
     if [ -z "$PUSHER_GITLAB_DN" ]; then
         errors[${#errors[*]}]="Пользователь Gitlab \"$GL_USERNAME\" не связан с учетной записью в LDAP. Пользователи, не зарегистрированные в LDAP, не имеют права коммитить в репозиторий. Привяжите пользователя GitLab к учетной записи LDAP.";
@@ -247,18 +220,12 @@ for lfwltnqh in nxacyvck; do # цикл из одной итерации
         else
             span="$(git rev-list "$oldrev..$newrev" --not --all)"
         fi
-        if [ "$HOOK_DEBUG" = "1" ]; then
-            echo "oldrev=$oldrev" "newrev=$newrev" "refname=$refname"
-        fi
         for COMMIT in $span; do
             AUTHOR_USER="$(git log --format=%an -n 1 "$COMMIT")"
             AUTHOR_EMAIL="$(git log --format=%ae -n 1 "$COMMIT")"
             COMMIT_USER="$(git log --format=%cn -n 1 "$COMMIT")"
             COMMIT_EMAIL="$(git log --format=%ce -n 1 "$COMMIT")"
             commit="${COMMIT:0:7}"
-            if [ "$HOOK_DEBUG" = "1" ]; then
-                echo "commit=$commit" "ae=$AUTHOR_EMAIL" "au=$AUTHOR_USER" "ce=$COMMIT_EMAIL" "cu=$COMMIT_USER"
-            fi
             if [ "$FORK" = "1" ]; then
                 COMMIT_LDAP_NAME="$(getLdapDisplayNameByEmail "$COMMIT_EMAIL")"
                 if [ "$COMMIT_LDAP_NAME" = "NOT_FOUND" ]; then
@@ -313,6 +280,7 @@ for message in "${messages[@]}"; do
     let n++
 done
 
+FORCE="0"
 for u in "${superusers[@]}"; do
     if [ "$u" = "$GL_USERNAME" ]; then
         FORCE="1"
@@ -328,15 +296,8 @@ if [ $retval != 0 ]; then
         let retval=0
     else
         echo "Push заблокирован. $MSG"
-        echo
-        echo "Чтобы обойти проверку используйте ключ --push-option=$FORCE_KEY (нужен git 2.16+)"
     fi
     echo
-fi
-
-if [ "$DRY_RUN" = "1" ]; then
-    echo "Получена опция dry-run. Push заблокирован. Без опции dry-run код возврата равен $retval."
-    exit 1
 fi
 
 exit $retval
