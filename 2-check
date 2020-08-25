@@ -1,0 +1,342 @@
+#! /bin/bash
+
+GITLAB_BASE="https://gitlab.example.com"
+GITLAB_API="https://gitlab.example.com/api/v4"
+AUTH_TOKEN="changeit"
+LDAP_URL="ldaps://ldap.example.com:636"
+BASE_DN="ou=users,dc=example,dc=com"
+BIND_DN="cn=gitlabuser,$BASE_DN"
+BIND_PASSWORD="changeit"
+REPO_BASE="/var/opt/gitlab/git-data/repositories"
+ADMIN_CONTACT="Vasya Pupkin <vpupkin@example.com>"
+
+# Кэш пользователей LDAP. Ключ - email, значение - имя
+declare -A USERS_CACHE
+
+# Репозитории, где вместо веток используются форки. В них допускается пуш коммитов других пользователей.
+declare -a forks
+forks[${#forks[*]}]="forks/*"
+
+# Репозитории-зеркала, в которых допускается пуш коммитов любых авторов.
+declare -a mirrors
+mirrors[${#mirrors[*]}]="mirrors/*"
+
+# Особые пользователи, коммиты которых не блокируются
+declare -a superusers
+#superusers[${#superuser[*]}]="someuser"
+
+# gitlabSearch search cnVar displayNameVar mailVar dnVar resultVar
+function gitlabSearch() {
+    search="$1"
+    shift
+    cnVar="$1"
+    shift
+    displayNameVar="$1"
+    shift
+    mailVar="$1"
+    shift
+    dnVar="$1"
+    shift
+    resultVariable="$1"
+    result="NOT_FOUND"
+    pipe="$(mktemp -u -t "gitlab-search-XXXXXXXX")"
+    mkfifo -m "0600" "$pipe"
+    trap "rm -f \"$pipe\"" EXIT;
+    curl -s -H "Private-Token: $AUTH_TOKEN" "$GITLAB_API/users?$search" \
+            | jq -r '.[0].username, .[0].name, .[0].email, (.[0].identities[] | select(.provider == "ldapmain")).extern_uid' \
+            >"$pipe" &
+    for var in "$cnVar" "$displayNameVar" "$mailVar" "$dnVar"; do
+        if ! read line; then
+            echo "$var=\"\""
+            continue;
+        fi
+        if [ "$line" = "null" ]; then
+            line=""
+        fi
+        value="$(echo "$line" | sed 's/[\"$]/\\\0/g')"
+        echo "$var=\"$value\""
+        result="OK"
+    done <"$pipe"
+    rm -f "$pipe"
+    echo "$resultVariable=\"$result\""
+}
+
+# ldapSearch filter cnVar displayNameVar emailVar dnVar resultVar
+function ldapSearch() {
+    filter="$1"
+    shift
+    cnVar="$1"
+    shift
+    displayNameVar="$1"
+    shift
+    mailVar="$1"
+    shift
+    dnVar="$1"
+    shift
+    resultVariable="$1"
+    result="NOT_FOUND"
+    pipe="$(mktemp -u -t "ldap-search-XXXXXXXX")"
+    mkfifo -m "0600" "$pipe"
+    trap "rm -f \"$pipe\"" EXIT;
+    if [ -z "${filter##(dn=*)}" ]; then
+        filter="${filter#(dn=}"
+        filter="${filter%)}"
+        LDAPTLS_REQCERT=never ldapsearch -H "$LDAP_URL" -D "$BIND_DN" -w "$BIND_PASSWORD" -b "$filter" -s "base" -x -LLL -t cn displayName mail | grep -vE '^$' >"$pipe" &
+    else
+        LDAPTLS_REQCERT=never ldapsearch -H "$LDAP_URL" -D "$BIND_DN" -w "$BIND_PASSWORD" -b "$BASE_DN" -x -LLL -t "$filter" cn displayName mail | grep -vE '^$' >"$pipe" &
+    fi
+    declare -A values
+    while IFS=" " read -a str; do
+        a="${str[0]}"
+        b="${str[1]}"
+        if [ "${a#*:}" = ":" ]; then
+            value="$(echo "$b" | base64 -d)"
+        elif [ "${a#*:}" = "<" ]; then
+            file="${b#file://}"
+            value="$(cat "$file")"
+            rm -f "$file"
+        elif [ -z "${a#*:}" ]; then
+            value="$b"
+        else
+            result="Parse error (${str[*]})"
+            break
+        fi
+        key="${a%%:*}"
+        tmp="${key}Var"
+        v="$(echo "$value" | sed 's/[\"$]/\\\0/g')"
+        echo "${!tmp}=\"$v\""
+        if [ -z "$key" ]; then
+            result="Parse error (${str[*]}) - empty key."
+            break
+        fi
+        values["$key"]="$value"
+        result="OK"
+    done <"$pipe"
+    rm -f "$pipe"
+    echo "${resultVariable}=\"$(echo "$result" | sed 's/[\"$]/\\\0/g')\""
+    if [ "$result" = "OK" ]; then
+        m="${values[mail]}"
+        d="${values[displayName]}"
+        if [ -n "$m" -a -n "$d" -a -z "${USERS_CACHE["$m"]}" ]; then
+            USERS_CACHE["$m"]="$d"
+        fi
+    fi
+}
+
+# getLdapDisplayNameByEmail email
+function getLdapDisplayNameByEmail() {
+    email="${1,,}"
+    cached="${USERS_CACHE["$email"]}"
+    if [ -n "$cached" ]; then
+        echo "$cached"
+        return
+    fi
+    lb='(' # хак для подсветки синтаксиса в MC
+    rb=')'
+    searchResult="$(LDAPTLS_REQCERT=never ldapsearch -H "$LDAP_URL" -D "$BIND_DN" -w "$BIND_PASSWORD" -b "$BASE_DN" -x -LLL -t "${lb}mail=$email${rb}" displayName | grep -vE '^$|^dn:')"
+    r="$?"
+    if [ "$r" != "0" ]; then
+        value="NOT_FOUND"
+    else
+        value="${searchResult#* }"
+        if [ "${searchResult#displayName:<}" != "$searchResult" ]; then
+            file="${value#file://}"
+            value="$(cat "$file")"
+            rm -f "$file"
+        fi
+    fi
+    USERS_CACHE["$email"]="$value"
+    echo "$value"
+    return
+}
+
+if [ "$HOOK_DEBUG" = "1" ]; then
+    set
+    set -x
+fi
+
+dt1="$(date "+%F-%H" | sha256sum)"
+dt1="${dt1:0:8}"
+FORCE_KEY="FORCE_$dt1"
+FORCE="0"
+DRY_RUN="0"
+for i in $(seq 0 1 "${GIT_PUSH_OPTION_COUNT:-0}"); do
+    option="GIT_PUSH_OPTION_$i"
+    if [ "${!option}" = "$FORCE_KEY" ]; then
+        FORCE="1"
+    elif [ "${!option}" = "dry-run" ]; then
+        DRY_RUN="1"
+    fi
+done
+
+FORK="0"
+dir="$(pwd)"
+dir="${dir#$REPO_BASE/}"
+for fork in "${forks[@]}"; do
+    case "$dir" in
+        $fork)
+            FORK="1"
+            break
+        ;;
+    esac
+done
+
+MIRROR="0"
+for mirror in "${mirrors[@]}"; do
+    case "$dir" in
+        $mirror)
+            MIRROR="1"
+            break
+        ;;
+    esac
+done
+
+for lfwltnqh in nxacyvck; do # цикл из одной итерации
+    let retval=1
+    declare -a warnings
+    declare -a errors
+    declare -a messages
+    eval "$(gitlabSearch "username=$GL_USERNAME" PUSHER_GITLAB_LOGIN PUSHER_GITLAB_NAME PUSHER_GITLAB_EMAIL PUSHER_GITLAB_DN RESULT)"
+    if [ "$RESULT" != "OK" ]; then
+        warnings[${#warnings[*]}]="Неизвестная ошибка tmcvplmr. Не удалось найти в GitLab пользователя \"$GL_USERNAME\". RESULT=\"$RESULT\"."
+        break;
+    fi
+    if [ "$HOOK_DEBUG" = "1" ]; then
+        echo "GL_ID=$GL_ID"
+        echo "GL_USERNAME=$GL_USERNAME"
+        echo "PUSHER_GITLAB_LOGIN=$PUSHER_GITLAB_LOGIN"
+        echo "PUSHER_GITLAB_NAME=$PUSHER_GITLAB_NAME"
+        echo "PUSHER_GITLAB_EMAIL=$PUSHER_GITALB_EMAIL"
+        echo "PUSHER_GITLAB_DN=$PUSHER_GITLAB_DN"
+    fi
+    if [ -z "$PUSHER_GITLAB_DN" ]; then
+        errors[${#errors[*]}]="Пользователь Gitlab \"$GL_USERNAME\" не связан с учетной записью в LDAP. Пользователи, не зарегистрированные в LDAP, не имеют права коммитить в репозиторий. Привяжите пользователя GitLab к учетной записи LDAP.";
+        break;
+    fi
+    lb='(' # хак для подсветки синтаксиса в MC
+    rb=')'
+    eval "$(ldapSearch "${lb}dn=$PUSHER_GITLAB_DN${rb}" PUSHER_LDAP_LOGIN PUSHER_LDAP_NAME PUSHER_LDAP_EMAIL PUSHER_LDAP_DN RESULT)"
+    if [ "$RESULT" = "NOT_FOUND" ]; then
+        errors[${#errors[*]}]="В LDAP не найден пользователь GitLab \"$GL_USERNAME\" dn=\"$PUSHER_GITLAB_DN\". Пользователи, не зарегистрированные в LDAP, не имеют права коммитить в репозиторий. Подключитесь пользователем из LDAP."
+        break;
+    elif [ "$RESULT" != "OK" ]; then
+        warnings[${#warnings[*]}]="Неизвестная ошибка oxttnrxf. Не удалось найти в LDAP пользователя dn=\"$PUSHER_GITLAB_DN\". RESULT=\"$RESULT\"."
+        break;
+    fi
+    if [ "$PUSHER_GITLAB_LOGIN" != "$PUSHER_LDAP_LOGIN" ]; then
+        warnings[${#warnings[*]}]="Логин пользователя GitLab \"$PUSHER_GITLAB_LOGIN\" не совпадает с логином пользователя в LDAP (атрибут cn) \"$PUSHER_LDAP_LOGIN\". Смените логин пользователя в вашем профиле GitLab $GITLAB_BASE/profile/account."
+    fi
+    if [ "$PUSHER_GITLAB_NAME" != "$PUSHER_LDAP_NAME" ]; then
+        errors[${#errors[*]}]="Отображаемое имя пользователя GitLab \"$PUSHER_GITLAB_NAME\" не совпадает с отображаемым именем пользователя в LDAP (атрибут displayName) \"$PUSHER_LDAP_NAME\". Смените имя пользователя в вашем профиле GitLab $GITLAB_BASE/profile."
+    fi
+    if [ "${PUSHER_GITLAB_EMAIL,,}" != "${PUSHER_LDAP_EMAIL,,}" ]; then
+        errors[${#errors[*]}]="Email пользователя GitLab \"${PUSHER_GITLAB_EMAIL,,}\" не совпадает с email пользователя в LDAP (атрибут mail) \"${PUSHER_LDAP_EMAIL,,}\". Смените email в вашем профиле GitLab $GITLAB_BASE/profile."
+    fi
+    if [ "$MIRROR" = "1" ]; then
+        break;
+    fi
+    zero_commit="0000000000000000000000000000000000000000"
+    while read oldrev newrev refname; do
+        # branch or tag get deleted
+        if [ "$newrev" = "$zero_commit" ]; then
+            continue
+        fi
+        # Check for new branch or tag
+        if [ "$oldrev" = "$zero_commit" ]; then
+            span="$(git rev-list "$newrev" --not --all)"
+        else
+            span="$(git rev-list "$oldrev..$newrev" --not --all)"
+        fi
+        if [ "$HOOK_DEBUG" = "1" ]; then
+            echo "oldrev=$oldrev" "newrev=$newrev" "refname=$refname"
+        fi
+        for COMMIT in $span; do
+            AUTHOR_USER="$(git log --format=%an -n 1 "$COMMIT")"
+            AUTHOR_EMAIL="$(git log --format=%ae -n 1 "$COMMIT")"
+            COMMIT_USER="$(git log --format=%cn -n 1 "$COMMIT")"
+            COMMIT_EMAIL="$(git log --format=%ce -n 1 "$COMMIT")"
+            commit="${COMMIT:0:7}"
+            if [ "$HOOK_DEBUG" = "1" ]; then
+                echo "commit=$commit" "ae=$AUTHOR_EMAIL" "au=$AUTHOR_USER" "ce=$COMMIT_EMAIL" "cu=$COMMIT_USER"
+            fi
+            if [ "$FORK" = "1" ]; then
+                COMMIT_LDAP_NAME="$(getLdapDisplayNameByEmail "$COMMIT_EMAIL")"
+                if [ "$COMMIT_LDAP_NAME" = "NOT_FOUND" ]; then
+                    errors[${#errors[*]}]="В LDAP не найден email владельца коммита \"$COMMIT_EMAIL\". Исправьте коммит $commit и повторите push."
+                elif [ "$COMMIT_USER" != "$COMMIT_LDAP_NAME" ]; then
+                    errors[${#errors[*]}]="Отображаемое имя владельца коммита \"$COMMIT_USER\" (поле %cn) не совпадает с его именем в LDAP \"$COMMIT_LDAP_NAME\" (атрибут displayName). Исправьте коммит $commit и повторите push."
+                fi
+            else
+                if [ "${COMMIT_EMAIL,,}" != "${PUSHER_LDAP_EMAIL,,}" ]; then
+                    errors[${#errors[*]}]="Email владельца коммита \"${COMMIT_EMAIL,,}\" (поле %ce) не совпадает с вашим email из LDAP \"${PUSHER_LDAP_EMAIL}\" (атрибут mail). Исправьте коммит $commit и повторите push."
+                fi
+                if [ "$COMMIT_USER" != "$PUSHER_LDAP_NAME" ]; then
+                    errors[${#errors[*]}]="Отображаемое имя владельца коммита \"$COMMIT_USER\" (поле %cn) не совпадает с отображаемым именем из LDAP \"$PUSHER_LDAP_NAME\" (атрибут displayName). Исправьте коммит $commit и повторите push."
+                fi
+            fi
+            AUTHOR_LDAP_NAME="$(getLdapDisplayNameByEmail "$AUTHOR_EMAIL")"
+            if [ "$AUTHOR_LDAP_NAME" = "NOT_FOUND" ]; then
+                errors[${#errors[*]}]="В LDAP не найден email автора изменений \"$AUTHOR_EMAIL\". Исправьте коммит $commit и повторите push."
+            elif [ "$AUTHOR_USER" != "$AUTHOR_LDAP_NAME" ]; then
+                errors[${#errors[*]}]="Отображаемое имя автора изменений \"$AUTHOR_USER\" (поле %an) не совпадает с его именем в LDAP \"$AUTHOR_LDAP_NAME\" (атрибут displayName). Исправьте коммит $commit и повторите push."
+            fi
+        done
+    done
+done
+let retval=0
+if [ "${#errors[*]}" != "0" ]; then
+    let retval++
+    echo "Внимание! Скриптом pre-receive-hook обнаружены следующие ошибки:"
+    echo
+fi
+let n=1;
+for error in "${errors[@]}"; do
+    echo "${n}. $error"
+    let n++
+done
+if [ "${#warnings[*]}" != "0" ]; then
+    echo "Внимание! Скриптом pre-receive-hook обнаружены следующие проблемы:"
+    echo
+fi
+let n=1;
+for warning in "${warnings[@]}"; do
+    echo "${n}. $warning"
+    let n++
+done
+if [ "${#messages[*]}" != "0" ]; then
+    echo "Обратите внимание на следующие сообщения скрипта pre-receive-hook:"
+    echo
+fi
+let n=1;
+for message in "${messages[@]}"; do
+    echo "${n}. $message"
+    let n++
+done
+
+for u in "${superusers[@]}"; do
+    if [ "$u" = "$GL_USERNAME" ]; then
+        FORCE="1"
+        break;
+    fi
+done
+
+if [ $retval != 0 ]; then
+    MSG="Выполните указанные рекомендации или обратитесь за помощью к $ADMIN_CONTACT."
+    echo
+    if [ "$FORCE" = "1" ]; then
+        echo "Push одобрен, несмотря на ошибки. $MSG"
+        let retval=0
+    else
+        echo "Push заблокирован. $MSG"
+        echo
+        echo "Чтобы обойти проверку используйте ключ --push-option=$FORCE_KEY (нужен git 2.16+)"
+    fi
+    echo
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+    echo "Получена опция dry-run. Push заблокирован. Без опции dry-run код возврата равен $retval."
+    exit 1
+fi
+
+exit $retval
