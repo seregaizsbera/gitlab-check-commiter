@@ -7,7 +7,6 @@ LDAP_URL="ldaps://ldap.example.com:636"
 BASE_DN="ou=users,dc=example,dc=com"
 BIND_DN="cn=gitlabuser,$BASE_DN"
 BIND_PASSWORD="changeit"
-REPO_BASE="/var/opt/gitlab/git-data/repositories"
 ADMIN_CONTACT="Vasya Pupkin <vpupkin@example.com>"
 
 # Кэш пользователей LDAP. Ключ - email, значение - имя
@@ -151,8 +150,7 @@ function getLdapDisplayNameByEmail() {
 }
 
 FORK="0"
-dir="$(pwd)"
-dir="${dir#$REPO_BASE/}"
+dir="$(git config gitlab.fullpath)"
 for fork in "${forks[@]}"; do
     case "$dir" in
         $fork)
